@@ -1,22 +1,28 @@
 package main
 
 import (
-	"log"
-	"log/slog"
+	"bufio"
 	"math"
+	"os"
+	"reflect"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/bluenviron/gomavlib/v3"
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/ardupilotmega"
 	"github.com/bluenviron/gomavlib/v3/pkg/dialects/common"
 	"github.com/bluenviron/gomavlib/v3/pkg/message"
 	"github.com/bluenviron/goroslib/v2"
+	"github.com/charmbracelet/log"
 )
 
 type Master struct {
 	// Connections
 	pixhawk *gomavlib.Node
 	ros     *goroslib.Node
+	target_system uint8
+	target_component uint8
 	// Publishers & Subscribers
 	command_sub   *goroslib.Subscriber
 	thruster_sub  *goroslib.Subscriber
@@ -30,19 +36,24 @@ type Master struct {
 	channel_arr [8]int
 	armed       bool
 	mode        string
+	// Misc
+	log_misc bool
 }
 
 func NewApplication(_pixhawk *gomavlib.Node, _ros *goroslib.Node) Master {
-	slog.Info("[*] Initializing new application")
+	log.Info("[*] Initializing new application")
 	app := Master{
 		pixhawk: _pixhawk,
 		ros:     _ros,
+		target_system: 0,
+		target_component: 0,
 
 		heartbeat_ch: make(chan struct{}),
 		ack_ch:       make(chan ardupilotmega.MessageCommandAck),
 		telemetry_ch: make(chan message.Message),
 
 		autonomous: false,
+		log_misc: true,
 	}
 	n := app.ros
 
@@ -73,7 +84,7 @@ func NewApplication(_pixhawk *gomavlib.Node, _ros *goroslib.Node) Master {
 	telemetry_pub, err := goroslib.NewPublisher(goroslib.PublisherConf{
 		Node:  n,
 		Topic: "/master/telemetry",
-		Msg:   Telemetry{},
+		Msg:   &Telemetry{},
 	})
 
 	if err != nil {
@@ -85,7 +96,8 @@ func NewApplication(_pixhawk *gomavlib.Node, _ros *goroslib.Node) Master {
 }
 
 func (app *Master) cleanup() {
-	slog.Info("[*] Cleanup up\n")
+	log.Info("[*] Cleanup up\n")
+	app.ArmOrDisarm(false)
 	app.telemetry_pub.Close()
 	app.command_sub.Close()
 	app.thruster_sub.Close()
@@ -96,28 +108,57 @@ func (app *Master) cleanup() {
 func (app *Master) ArmOrDisarm(arm bool) {
 	app.armed = arm
 	<-app.heartbeat_ch
-	arm_v := 0.0
+	var arm_v float32 = 0.0
 	if arm {
 		arm_v = 1.0
 	}
-	app.pixhawk.WriteMessageAll(&ardupilotmega.MessageCommandLong{
-		TargetSystem:    0,
-		TargetComponent: 0,
-		Command:         common.MAV_CMD_COMPONENT_ARM_DISARM,
-		Confirmation:    0,
-		Param1:          float32(arm_v),
-		Param2:          0,
-		Param3:          0,
-		Param4:          0,
-		Param5:          0,
-		Param6:          0,
-		Param7:          0,
-	})
-	if arm {
-		slog.Warn("[PIXHAWK] ARM Command Sent\n")
-	} else {
-		slog.Warn("[PIXHAWK] DISARM Command Sent\n")
+
+	var confirmation_count uint8 = 0
+	var ack_result common.MAV_RESULT = common.MAV_RESULT_UNSUPPORTED;
+	ack_loop:
+	for {
+		err := app.pixhawk.WriteMessageAll(&ardupilotmega.MessageCommandLong{
+			TargetSystem: app.target_system,
+			TargetComponent: app.target_component,
+			Command: common.MAV_CMD(ardupilotmega.MAV_CMD_COMPONENT_ARM_DISARM),
+			Confirmation: confirmation_count,
+			Param1: arm_v,
+			Param2: 21196,
+		});
+
+		if err != nil {
+			log.Error("Error sending command to pixhawk", err);
+		}
+
+		select {
+		case <-time.After(2 * time.Second):
+			log.Info("Ack timed out");
+			break;
+		case ack := <-app.ack_ch:
+			if (ack.Command == common.MAV_CMD(ardupilotmega.MAV_CMD_COMPONENT_ARM_DISARM)) {
+				log.Info("Got response from pixhawk, ", "ack", ack);
+				ack_result = ack.Result;
+				break ack_loop;
+			} else {
+				log.Info("Got wrong ack", "ack", ack);
+				break ack_loop;
+			} 
+		}
+
+		confirmation_count = confirmation_count + 1;
+		if (confirmation_count >= 5) {
+			log.Error("Failed to ARM / DISARM pixhawk, no ack after 255 commands");
+			break;
+		}
 	}
+
+	if arm {
+		log.Warn("[PIXHAWK] ARM Command Sent", "result", ack_result);
+	} else {
+		log.Warn("[PIXHAWK] DISARM Command Sent", "result", ack_result);
+	}
+
+
 }
 
 func (app *Master) SwitchMode(mode string) {
@@ -139,15 +180,20 @@ func (app *Master) SwitchMode(mode string) {
 	mode_val, ok := values_SUB_MODE[mode]
 
 	if !ok {
-		slog.Warn("Invalid Mode: ", "mode", mode)
+		log.Warn("Invalid Mode: ", "mode", mode)
 		return
 	}
 
 	app.mode = mode
-	app.pixhawk.WriteMessageAll(&ardupilotmega.MessageSetMode{
+	err := app.pixhawk.WriteMessageAll(&ardupilotmega.MessageSetMode{
 		BaseMode:   common.MAV_MODE(common.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
 		CustomMode: uint32(mode_val),
 	})
+
+	if err != nil {
+		log.Error("Failed to set pixhawk mode", "error", err);
+	}
+
 }
 
 func (app *Master) onCommandMessage(msg *Commands) {
@@ -177,7 +223,7 @@ func (app *Master) evaluateCommand(msg *Commands) {
 
 	if app.mode != msg.Mode {
 		if app.armed {
-			slog.Warn("Disarm Pixhawk to change modes")
+			log.Warn("Disarm Pixhawk to change modes")
 			return
 		} else {
 			app.SwitchMode(msg.Mode)
@@ -207,13 +253,13 @@ const (
 func (app *Master) handleTelemetry() {
 	telemetry_msg := Telemetry{}
 
-	app.requestMessageAtInterval(SYS_STATUS_MSG_ID, 100)
-	app.requestMessageAtInterval(HEARTBEAT_MSG_ID, 100)
-	app.requestMessageAtInterval(ATTITUDE_QUATERNION_MSG_ID, 100)
-	app.requestMessageAtInterval(AHRS2_MSG_ID, 100)
-	app.requestMessageAtInterval(SCALED_IMU2_MSG_ID, 100)
-	app.requestMessageAtInterval(VFR_HUD_MSG_ID, 100)
-	app.requestMessageAtInterval(SCALED_PRESSURE2_MSG_ID, 100)
+	go app.requestMessageAtInterval(SYS_STATUS_MSG_ID, 100)
+	go app.requestMessageAtInterval(HEARTBEAT_MSG_ID, 100)
+	go app.requestMessageAtInterval(ATTITUDE_QUATERNION_MSG_ID, 100)
+	go app.requestMessageAtInterval(AHRS2_MSG_ID, 100)
+	go app.requestMessageAtInterval(SCALED_IMU2_MSG_ID, 100)
+	go app.requestMessageAtInterval(VFR_HUD_MSG_ID, 100)
+	go app.requestMessageAtInterval(SCALED_PRESSURE2_MSG_ID, 100)
 
 	for {
 		data := <-app.telemetry_ch
@@ -222,7 +268,7 @@ func (app *Master) handleTelemetry() {
 			telemetry_msg.BatteryVoltage = float32(msg.VoltageBattery) / 1000
 
 			if telemetry_msg.BatteryVoltage < 15 {
-				slog.Warn("Battery Critically Low ", "battery level", telemetry_msg.BatteryVoltage)
+				log.Warn("Battery Critically Low ", "battery level", telemetry_msg.BatteryVoltage)
 			}
 		case *ardupilotmega.MessageScaledImu:
 			telemetry_msg.Timestamp = int32(msg.TimeBootMs)
@@ -245,17 +291,17 @@ func (app *Master) handleTelemetry() {
 		case *ardupilotmega.MessageScaledPressure2:
 			telemetry_msg.ExternalPressure = msg.PressAbs
 		default:
-			slog.Warn("Unhandled telemetry message recieved ", "msg", msg)
+			log.Warn("Unhandled telemetry message recieved ", "msg", reflect.TypeOf(data).String());
 			continue
 		}
-		app.telemetry_pub.Write(telemetry_msg)
+		app.telemetry_pub.Write(&telemetry_msg)
 	}
 }
 
 // Modify SINGLE RC channel PWM
 func (app *Master) SetRCChannelPWM(channel int, pwm int) {
 	if channel < 1 || channel > 8 {
-		slog.Warn("Invalid Channel ", "channel", channel)
+		log.Warn("Invalid Channel ", "channel", channel)
 		return
 	}
 
@@ -301,38 +347,44 @@ func (app *Master) updateRCChannels() {
 }
 
 func (app *Master) handleEventFrame(frm *gomavlib.EventFrame) {
+	// TODO: Find better solution
+	app.target_component = frm.ComponentID();
+	app.target_system = frm.SystemID();
 	switch msg := frm.Message().(type) {
 	case *ardupilotmega.MessageHeartbeat:
-		// slog.Info("[PIXHAWK] Recieved heartbeat\n");
+		log.Info("[PIXHAWK] Recieved heartbeat");
 		app.heartbeat_ch <- struct{}{}
-	case *ardupilotmega.MessageCommandAck:
-		slog.Info("[PIXHAWK] Recieved Command Acknowledgement\n")
+	case *common.MessageCommandAck:
+		log.Info("[PIXHAWK] Recieved Command Acknowledgement")
 		app.ack_ch <- *msg
-	case *ardupilotmega.MessageScaledImu2:
-	case *ardupilotmega.MessageVfrHud:
-	case *ardupilotmega.MessageAttitudeQuaternion:
-	case *ardupilotmega.MessageScaledPressure2:
-	case *ardupilotmega.MessageSysStatus:
-		slog.Info("[PIXHAWK] Recieved Telemetry Message", "message", msg)
+	case *ardupilotmega.MessageStatustext:
+		log.Info("[PIXHAWK]", "status_text", msg.Text);
+	case *ardupilotmega.MessageAhrs2, *ardupilotmega.MessageScaledImu2, *ardupilotmega.MessageVfrHud, *ardupilotmega.MessageAttitudeQuaternion, *ardupilotmega.MessageScaledPressure2, *ardupilotmega.MessageSysStatus:
+		if app.log_misc {
+			log.Info("[PIXHAWK] Recieved Telemetry Message", "message", reflect.TypeOf(msg).String());
+		}
 		app.telemetry_ch <- msg
-	default:
-		slog.Warn("[PIXHAWK] Unhandeled Message Type ", "msg", msg)
+	default:	
+		if app.log_misc {
+			log.Warn("[PIXHAWK] Unhandeled Message Type ", "msg_type", reflect.TypeOf(msg).String(), "msg", msg);
+		}
+		return;
 	}
 }
 
 func (app *Master) listenForEvents() {
-loop:
+// loop:
 	for evt := range app.pixhawk.Events() {
 		switch v := evt.(type) {
 		case *gomavlib.EventChannelClose:
-			slog.Info("[PIXHAWK] Event channel closed\n")
-			break loop
+			log.Info("[PIXHAWK] Event channel closed")
+			// break loop
 		case *gomavlib.EventChannelOpen:
-			slog.Info("[PIXHAWK] Event channel opened\n")
+			log.Info("[PIXHAWK] Event channel opened")
 		case *gomavlib.EventParseError:
-			slog.Warn("[PIXHAWK] Event parse error ", "err", v)
+			log.Warn("[PIXHAWK] Event parse error ", "err", v)
 		case *gomavlib.EventFrame:
-			app.handleEventFrame(v)
+			go app.handleEventFrame(v)
 		}
 	}
 }
@@ -342,33 +394,35 @@ func (app *Master) waitForHeartbeat() {
 }
 
 func (app *Master) requestMessageAtInterval(msgId uint16, freq_hz int) {
+	log.Info("Request message at interval", "msgid", msgId, "freq", freq_hz);
 	app.pixhawk.WriteMessageAll(&ardupilotmega.MessageMessageInterval{
 		IntervalUs: int32(1e6 / freq_hz),
 		MessageId:  msgId,
 	})
 
+	// need to wait till its own acknowledgement comes through
 	ack := <-app.ack_ch
 	if ack.Result == ardupilotmega.MAV_RESULT_ACCEPTED && ack.Command == common.MAV_CMD_SET_MESSAGE_INTERVAL {
-		slog.Info("[PIXHAWK] Succeded request to modify interval of message", "id", msgId)
+		log.Info("[PIXHAWK] Succeded request to modify interval of message", "id", msgId)
 	} else {
-		slog.Error("[PIXHAWK] Failed request to modify interval of message", "id", msgId)
+		log.Error("[PIXHAWK] Failed request to modify interval of message", "id", msgId)
 	}
 }
 
 func main() {
 	// -- INIT NODE --
-	log.Print("[ROS] Connecting to ROS Core\n")
+	log.Info("[ROS] Connecting to ROS Core")
 	n, err := goroslib.NewNode(goroslib.NodeConf{
 		Name: "pymav_master",
 	})
 
 	if err != nil {
-		log.Fatal("[ROS] Failed to register node!, Is roscore running?\n", err)
+		log.Fatal("[ROS] Failed to register node!, Is roscore running?", "err", err)
 	}
 	defer n.Close()
 
 	// MAVLINK
-	log.Print("[PIXHAWK] Connecting to PixHawk\n")
+	log.Info("[PIXHAWK] Connecting to PixHawk\n")
 	mav_node, err := gomavlib.NewNode(gomavlib.NodeConf{
 		Endpoints: []gomavlib.EndpointConf{
 			gomavlib.EndpointSerial{
@@ -379,17 +433,57 @@ func main() {
 		Dialect:     ardupilotmega.Dialect,
 		OutVersion:  gomavlib.V2,
 		OutSystemID: 11,
+		HeartbeatDisable: true,
 	})
 
 	if err != nil {
-		log.Fatal("[PIXHAWK] Failed to connect to Pixhawk!\n", err)
+		log.Fatal("[PIXHAWK] Failed to connect to Pixhawk!", err)
 	}
 	defer mav_node.Close()
 
 	// Setup State
 	app := NewApplication(mav_node, n)
-	go app.listenForEvents()
-	go app.handleTelemetry()
-	go app.updateRCChannels()
-	slog.Info("[*] Init Complete\n")
+
+	var wg sync.WaitGroup;
+	defer wg.Wait();
+
+	wg.Add(4);
+	go func() {
+		app.listenForEvents();
+		log.Warn("[*] Finished listening for events");
+		wg.Done();
+	}(); 
+
+	go func(){
+		app.handleTelemetry();
+		log.Warn("[*] Finished handling telemetry");
+		wg.Done();
+	}();
+
+	go func(){
+		app.updateRCChannels();
+		log.Warn("[*] Finished updating RC channels");
+		wg.Done();
+	}();
+
+	// Start listening for user input to arm or disarm the vehicle
+	go func() {
+		scanner := bufio.NewScanner(os.Stdin)
+		for {
+			scanner.Scan() // Capture user input
+			input := scanner.Text()
+
+			switch input {
+			case "arm":
+				app.ArmOrDisarm(true)
+			case "disarm":
+				app.ArmOrDisarm(false)
+			default:
+				log.Warn("Invalid input, please enter 'arm' or 'disarm'.")
+			}
+		}
+	}()
+
+	app.waitForHeartbeat();
+	log.Info("[*] Init Complete\n")
 }

@@ -48,6 +48,8 @@ class PixhawkMaster:
         self.channel_ary = [1500] * 8  # Initialize channel values array
         self.master.wait_heartbeat()  # Wait for the heartbeat from the Pixhawk
         self.telem_msg = telemetry()  # Initialize telemetry message
+        print(self.master.target_id)
+        print(self.master.target_component)
 
     def kill_callback(self, msg):
         if (msg.kill_switch == True):
